@@ -323,6 +323,7 @@ def strategies(d):
         cost_n=f"每月執行一次，年化成本攤薄約 {pr/cost*100*12:.0f}%（理論值）",
         warn=f"{'槓桿ETF IV 極高，若急升將錯失漲幅；' if lf else ''}股價若突破 ${sk:.2f}，持倉將被 Call 走。",
         roll=f"股價接近行使價時，考慮 Roll Up & Out 延長到期日。",
+        per_share_prem=pr,
     ))
 
     # 2 ── Protective Put
@@ -347,6 +348,7 @@ def strategies(d):
         cost_n=f"保護成本 ${pr:.2f}/股，相當於持倉成本增加 {pr/cost*100:.1f}%",
         warn=f"{'槓桿ETF Theta 衰減極快，建議縮短 DTE 或改用 Bear Put Spread；' if lf else ''}若股價橫盤，保護金將完全損耗。",
         roll=f"距到期 10 天且虧損未實現，考慮換入更低 Strike 延長保護。",
+        per_share_prem=pr,
     ))
 
     # 3 ── Bear Put Spread
@@ -374,6 +376,7 @@ def strategies(d):
         cost_n=f"最大風險僅 ${net:.2f}/股，比單買 Put 節省 {int((bp-net)/bp*100)}% 成本",
         warn=f"{'槓桿ETF 波幅大，建議選擇更寬價差；' if lf else ''}若股價反彈，最大損失為 ${net:.2f}。",
         roll=None,
+        per_share_prem=net,
     ))
 
     # 4 ── Bull Call Spread
@@ -402,6 +405,7 @@ def strategies(d):
             cost_n=f"最大損失 ${net:.2f}/股，股價須升破 ${bs+net:.2f} 方可獲利",
             warn=f"{'槓桿ETF Call 溢價急升，需快速止盈；' if lf else ''}需在到期前升破損益平衡點才獲利。",
             roll=f"盈利達 60–70% 時建議止盈，無需持有至到期。",
+            per_share_prem=net,
         ))
 
     # 5 ── Iron Condor
@@ -431,6 +435,7 @@ def strategies(d):
             cost_n=f"每月執行，年化理論補貼約 ${tot*12:.2f}/股",
             warn=f"{'槓桿ETF 單日波幅大，Iron Condor 較高風險；' if lf else ''}股價突破任一側須即時調整或平倉。",
             roll=f"股價接近任一側邊界時，考慮將該側向外滾倉（Roll Out）。",
+            per_share_prem=tot,
         ))
 
     out.sort(key=lambda x: not x["rec"])
@@ -446,30 +451,39 @@ def sig_row(dot_cls, label, val):
     return f'<div class="sig-row"><span class="dot {dot_cls}"></span><span class="sig-lbl">{label}</span><span class="sig-val">{val}</span></div>'
 
 def render_metrics(d):
-    pc = "cu" if d['pnl']>=0 else "cd"
-    pf = "+" if d['pnl']>=0 else ""
-    vc = "cu" if d['vr']>1.2 else "ca"
+    pc   = "cu" if d['pnl']>=0 else "cd"
+    pf   = "+" if d['pnl']>=0 else ""
+    vc   = "cu" if d['vr']>1.2 else "ca"
+    sh   = d.get('shares', 1)
+    tot_val  = d['px'] * sh
+    tot_cost = d['cost'] * sh
+    tot_pnl  = d['pnl'] * sh
+    tp_cls   = "cu" if tot_pnl >= 0 else "cd"
+    tp_pf    = "+" if tot_pnl >= 0 else ""
+    # contracts: 1 contract = 100 shares
+    contracts = sh // 100
+    contracts_note = f"{contracts} 張合約可用" if contracts > 0 else "不足 100 股／1 張"
     st.markdown(f"""
     <div class="m-row">
       <div class="m-card">
         <div class="m-label">當前股價</div>
         <div class="m-val ca">${d['px']:.2f}</div>
-        <div class="m-sub">{d['ticker']}</div>
+        <div class="m-sub">{d['ticker']}　持有 {sh:,} 股</div>
       </div>
       <div class="m-card">
-        <div class="m-label">持倉盈虧</div>
-        <div class="m-val {pc}">{pf}${d['pnl']:.2f}</div>
-        <div class="m-sub">{pf}{d['pnl_pct']:.1f}%　成本 ${d['cost']:.2f}</div>
+        <div class="m-label">總持倉市值</div>
+        <div class="m-val ca">${tot_val:,.0f}</div>
+        <div class="m-sub">成本總值 ${tot_cost:,.0f}</div>
       </div>
       <div class="m-card">
-        <div class="m-label">ATR(14) 日均波幅</div>
-        <div class="m-val cg">${d['atr']:.2f}</div>
-        <div class="m-sub">{d['atr']/d['px']*100:.1f}% 日波動</div>
+        <div class="m-label">總持倉盈虧</div>
+        <div class="m-val {tp_cls}">{tp_pf}${abs(tot_pnl):,.0f}</div>
+        <div class="m-sub">{pf}{d['pnl_pct']:.1f}%　每股 {pf}${abs(d['pnl']):.2f}</div>
       </div>
       <div class="m-card">
-        <div class="m-label">成交量比 (20MA)</div>
-        <div class="m-val {vc}">{d['vr']:.2f}x</div>
-        <div class="m-sub">{'放量' if d['vr']>1.2 else '縮量' if d['vr']<0.8 else '正常'}</div>
+        <div class="m-label">可用合約數</div>
+        <div class="m-val ca">{contracts}</div>
+        <div class="m-sub">{contracts_note}</div>
       </div>
     </div>""", unsafe_allow_html=True)
 
@@ -508,14 +522,33 @@ def render_signals(d):
           優先推薦 <b>Covered Call</b> 收取豐厚權利金，避免直接買入期權。
         </div>""", unsafe_allow_html=True)
 
-def render_strat(s, idx):
+def render_strat(s, idx, shares=100):
+    contracts = max(1, shares // 100)
     cls  = "sc top" if s['rec'] else "sc"
     tag  = '<span class="top-tag">⭐ 最佳推薦</span><br>' if s['rec'] else ""
-    acts = "".join([f'<div class="act">→ {a}</div>' for a in s['acts']])
+
+    # Inject contracts info into first action line
+    acts_with_cnt = []
+    for i, a in enumerate(s['acts']):
+        if i == 0:
+            # Replace "1張" with actual contract count
+            a_display = a.replace("1張", f"{contracts} 張")
+            acts_with_cnt.append(a_display)
+        else:
+            acts_with_cnt.append(a)
+    acts = "".join([f'<div class="act">→ {a}</div>' for a in acts_with_cnt])
+
     det  = "".join([f'<div class="dg-cell"><div class="dg-lbl">{k}</div><div class="dg-val">{v}</div></div>'
                     for k,v in s['det'].items()])
     gk   = "".join([f'<div class="gk"><span class="gk-k">{k}　</span><span class="gk-v">{v}</span></div>'
                     for k,v in s['gk'].items()])
+
+    # Position summary box
+    pos_html = ""
+    if s.get("per_share_prem") is not None:
+        total_prem = s["per_share_prem"] * 100 * contracts
+        pos_html = f'<div class="ib ib-cost">📦 <b>倉位合計（{shares:,} 股 / {contracts} 張合約）</b>：預計總收益／支出 <b>${total_prem:,.0f}</b></div>'
+
     cn   = f'<div class="ib ib-cost">💡 {s["cost_n"]}</div>' if s.get("cost_n") else ""
     wn   = f'<div class="ib ib-warn">⚠️ {s["warn"]}</div>'  if s.get("warn")   else ""
     rl   = f'<div class="ib ib-roll">🔄 {s["roll"]}</div>'  if s.get("roll")   else ""
@@ -528,7 +561,7 @@ def render_strat(s, idx):
       <div>{acts}</div>
       <div class="dg-grid">{det}</div>
       <div class="gk-row">{gk}</div>
-      {cn}{wn}{rl}
+      {pos_html}{cn}{wn}{rl}
     </div>""", unsafe_allow_html=True)
 
 
@@ -541,12 +574,14 @@ st.markdown("""
   <div class="pg-sub">輸入持倉資料，自動分析技術面並推薦最佳期權策略</div>
 </div>""", unsafe_allow_html=True)
 
-c1, c2, c3 = st.columns([2, 2, 1])
+c1, c2, c3, c4 = st.columns([2, 2, 1.5, 1])
 with c1:
     ticker_in = st.text_input("股票代碼", value="TSLA", placeholder="TSLA / TSLL / NVDA").upper().strip()
 with c2:
     cost_in = st.number_input("持倉成本價 ($)", min_value=0.01, value=370.0, step=0.5, format="%.2f")
 with c3:
+    shares_in = st.number_input("持有股數（股）", min_value=1, value=100, step=1)
+with c4:
     st.markdown("<br>", unsafe_allow_html=True)
     run = st.button("分析並生成策略")
 
@@ -556,9 +591,14 @@ if run or st.session_state.get("_t"):
     if run:
         st.session_state["_t"] = ticker_in
         st.session_state["_c"] = cost_in
+        st.session_state["_s"] = shares_in
+
+    shares = st.session_state.get("_s", 100)
 
     with st.spinner(f"正在抓取 {st.session_state['_t']} 數據並分析…"):
         data = fetch(st.session_state["_t"], st.session_state["_c"])
+        if data:
+            data['shares'] = shares
 
     if data is None:
         st.error(f"無法獲取 {st.session_state['_t']} 數據，請確認股票代碼正確。")
@@ -572,7 +612,7 @@ if run or st.session_state.get("_t"):
         with right:
             st.markdown('<div class="sec-lbl">期權策略推薦（詳細執行方案）</div>', unsafe_allow_html=True)
             for i, s in enumerate(strategies(data), 1):
-                render_strat(s, i)
+                render_strat(s, i, shares=data.get('shares', 100))
 
         st.markdown(f"""
         <div class="disc">
