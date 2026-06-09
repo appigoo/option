@@ -2,7 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -157,6 +157,7 @@ html, body, [class*="css"] {
 .ib-warn { background:var(--red-lt); color:#a93226; }
 .ib-roll { background:#f3f0e8; color:var(--gold); }
 .ib-lev  { background:var(--red-lt); color:#a93226; border:1px solid #e8b4b0; }
+.ib-sub100 { background:#fff8e6; color:#8a6800; border:1px solid #f0d97a; }
 
 /* ── MISC ── */
 .divider { border:none; border-top:1px solid var(--border); margin:1.1rem 0; }
@@ -224,68 +225,82 @@ def lev_x(t):  return 3 if t.upper() in LEV3 else (2 if t.upper() in LEV_ALL els
 
 # ─────────────────────────────────────────
 # DATA FETCH & ANALYSIS
+# FIX #7: 加 @st.cache_data(ttl=300) 避免重複抓取，提速
 # ─────────────────────────────────────────
+@st.cache_data(ttl=300)
 def fetch(ticker, cost):
-    tk   = yf.Ticker(ticker)
-    hist = tk.history(period="3mo", interval="1d")
-    if hist.empty: return None
+    try:
+        tk   = yf.Ticker(ticker)
+        hist = tk.history(period="3mo", interval="1d")
+        if hist.empty:
+            return None
 
-    c,h,l,v = hist['Close'], hist['High'], hist['Low'], hist['Volume']
-    px = float(c.iloc[-1])
+        c,h,l,v = hist['Close'], hist['High'], hist['Low'], hist['Volume']
+        px = float(c.iloc[-1])
 
-    _rsi        = rsi(c)
-    _macd,_sig,_hist = macd(c)
-    e20,e50     = c.ewm(span=20).mean(), c.ewm(span=50).mean()
-    bu,bm,bl    = bbands(c)
-    _atr        = atr(h,l,c)
+        _rsi             = rsi(c)
+        _macd,_sig,_hist = macd(c)
+        e20,e50          = c.ewm(span=20).mean(), c.ewm(span=50).mean()
+        bu,bm,bl         = bbands(c)
+        _atr             = atr(h,l,c)
 
-    r   = float(_rsi.iloc[-1])
-    m   = float(_macd.iloc[-1])
-    ms  = float(_sig.iloc[-1])
-    mh  = float(_hist.iloc[-1])
-    e20v= float(e20.iloc[-1]); e50v=float(e50.iloc[-1])
-    atrv= float(_atr.iloc[-1])
-    bbu = float(bu.iloc[-1]); bbl=float(bl.iloc[-1])
-    sup = float(l.rolling(20).min().iloc[-1])
-    res = float(h.rolling(20).max().iloc[-1])
-    avgv= float(v.rolling(20).mean().iloc[-1])
-    vr  = float(v.iloc[-1])/avgv if avgv>0 else 1.0
+        r   = float(_rsi.iloc[-1])
+        m   = float(_macd.iloc[-1])
+        ms  = float(_sig.iloc[-1])
+        mh  = float(_hist.iloc[-1])
+        e20v= float(e20.iloc[-1]); e50v=float(e50.iloc[-1])
+        atrv= float(_atr.iloc[-1])
+        bbu = float(bu.iloc[-1]); bbl=float(bl.iloc[-1])
+        sup = float(l.rolling(20).min().iloc[-1])
+        res = float(h.rolling(20).max().iloc[-1])
+        avgv= float(v.rolling(20).mean().iloc[-1])
+        vr  = float(v.iloc[-1])/avgv if avgv>0 else 1.0
 
-    sc = 0
-    if r<35:  sc+=2
-    elif r>65:sc-=2
-    if m>ms:  sc+=1
-    else:     sc-=1
-    if e20v>e50v: sc+=1
-    else:         sc-=1
-    if px<bbl: sc+=1
-    elif px>bbu: sc-=1
+        sc = 0
+        if r<35:    sc+=2
+        elif r>65:  sc-=2
+        if m>ms:    sc+=1
+        else:       sc-=1
+        if e20v>e50v: sc+=1
+        else:         sc-=1
+        if px<bbl:  sc+=1
+        elif px>bbu: sc-=1
+        # FIX #6: 加入成交量比作為額外信號，提升信心度準確性
+        if vr>1.5:
+            sc += 1 if m>ms else -1
 
-    if sc>=2:   trend,conf,tzh = "BULLISH",min(90,55+sc*8),"上升趨勢"
-    elif sc<=-2:trend,conf,tzh = "BEARISH",min(90,55+abs(sc)*8),"下跌趨勢"
-    else:       trend,conf,tzh = "NEUTRAL",55,"橫盤整固"
+        if sc>=2:    trend,conf,tzh = "BULLISH",min(90,55+sc*7),"上升趨勢"
+        elif sc<=-2: trend,conf,tzh = "BEARISH",min(90,55+abs(sc)*7),"下跌趨勢"
+        else:        trend,conf,tzh = "NEUTRAL",55,"橫盤整固"
 
-    iv_mult = 1.8 if is_lev(ticker) else 1.0
-    iv = min(0.95,(atrv/px)*np.sqrt(252)*iv_mult)
+        iv_mult = 1.8 if is_lev(ticker) else 1.0
+        # FIX #10: 加下限 0.05，防止 px 異常時 IV 趨近零
+        iv = max(0.05, min(0.95, (atrv/px)*np.sqrt(252)*iv_mult))
 
-    return dict(
-        ticker=ticker.upper(), px=px, cost=cost,
-        pnl=px-cost, pnl_pct=(px-cost)/cost*100,
-        rsi=r, macd=m, macd_sig=ms, macd_hist=mh,
-        e20=e20v, e50=e50v, atr=atrv,
-        bbu=bbu, bbl=bbl, sup=sup, res=res,
-        vr=vr, iv=iv,
-        trend=trend, tzh=tzh, conf=conf,
-        lev=is_lev(ticker), lx=lev_x(ticker),
-    )
+        return dict(
+            ticker=ticker.upper(), px=px, cost=cost,
+            pnl=px-cost, pnl_pct=(px-cost)/cost*100,
+            rsi=r, macd=m, macd_sig=ms, macd_hist=mh,
+            e20=e20v, e50=e50v, atr=atrv,
+            bbu=bbu, bbl=bbl, sup=sup, res=res,
+            vr=vr, iv=iv,
+            trend=trend, tzh=tzh, conf=conf,
+            lev=is_lev(ticker), lx=lev_x(ticker),
+        )
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────────
 # OPTION PREMIUM ESTIMATE
+# FIX #2: 深度 OTM 保護（>40% 距離直接返回最低值）
 # ─────────────────────────────────────────
 def prem(px, strike, dte, iv):
-    t = dte/365
-    mn= abs(px-strike)/px
+    t  = dte/365
+    mn = abs(px-strike)/px
+    # 深度 OTM 直接返回最低值，避免不合理估算
+    if mn > 0.40:
+        return 0.01
     atm = px*iv*np.sqrt(t)*0.4
     otm = max(0.15, 1-mn*3)
     return round(max(0.01, atm*otm), 2)
@@ -293,6 +308,9 @@ def prem(px, strike, dte, iv):
 
 # ─────────────────────────────────────────
 # STRATEGY ENGINE
+# FIX #3: acts 統一用 {C} placeholder 替代寫死 "1張"
+# FIX #4: Iron Condor 在所有 trend 下均顯示，NEUTRAL 才 rec=True
+# FIX #5: Bear Put Spread 只在 BEARISH/NEUTRAL 加入
 # ─────────────────────────────────────────
 def strategies(d):
     px,cost,iv  = d['px'], d['cost'], d['iv']
@@ -309,7 +327,7 @@ def strategies(d):
         name="Covered Call｜備兌認購",
         rec=(trend in ["NEUTRAL","BULLISH"] or pp<0),
         desc="持有正股，賣出虛值 Call 收取權利金，逐步攤薄持倉成本。橫盤或緩漲市況下效果最佳，每月滾倉可持續降低成本。",
-        acts=[f"賣出 1張 {d['ticker']} ${sk:.2f} Call",
+        acts=[f"賣出 {{C}}張 {d['ticker']} ${sk:.2f} Call",
               f"到期日  {(datetime.now()+timedelta(days=dte)).strftime('%Y-%m-%d')}（{dte} DTE）"],
         det={"建議行使價":f"${sk:.2f}（虛值 {int(otm*100)}%）",
              "到期天數":f"{dte} DTE",
@@ -334,7 +352,7 @@ def strategies(d):
         name="Protective Put｜保護性認沽",
         rec=(trend=="BEARISH" and pp>-10),
         desc="買入虛值 Put 作為保險，限定下行虧損上限。適合市況不明朗或持倉成本較高時使用。",
-        acts=[f"買入 1張 {d['ticker']} ${sk:.2f} Put",
+        acts=[f"買入 {{C}}張 {d['ticker']} ${sk:.2f} Put",
               f"到期日  {(datetime.now()+timedelta(days=dte)).strftime('%Y-%m-%d')}（{dte} DTE）"],
         det={"建議行使價":f"${sk:.2f}（虛值 10%）",
              "到期天數":f"{dte} DTE",
@@ -351,33 +369,34 @@ def strategies(d):
         per_share_prem=pr,
     ))
 
-    # 3 ── Bear Put Spread
-    dte=21
-    bs=round(px*0.97/0.5)*0.5; ss=round(px*0.82/0.5)*0.5
-    bp=prem(px,bs,dte,iv); sp=prem(px,ss,dte,iv)
-    net=round(bp-sp,2); mp=round((bs-ss)-net,2)
-    rr=round(mp/net,1) if net>0 else 0
-    out.append(dict(
-        name="Bear Put Spread｜熊市看跌價差",
-        rec=(trend=="BEARISH"),
-        desc="買入高 Strike Put，同時賣出低 Strike Put，以降低對沖成本。預期下跌但幅度有限時的低成本方案。",
-        acts=[f"買入 1張 {d['ticker']} ${bs:.2f} Put",
-              f"賣出 1張 {d['ticker']} ${ss:.2f} Put",
-              f"到期日  {(datetime.now()+timedelta(days=dte)).strftime('%Y-%m-%d')}（{dte} DTE）"],
-        det={"買入行使價":f"${bs:.2f} Put",
-             "賣出行使價":f"${ss:.2f} Put",
-             "淨支出 Net Debit":f"${net:.2f}/股　(${net*100:.0f}/張)",
-             "損益平衡點":f"${bs-net:.2f}",
-             "最大盈利":f"${mp:.2f}/股（股價跌至 ${ss:.2f} 以下）",
-             "最大虧損":f"${net:.2f}/股（僅限已付權利金）",
-             "回報風險比":f"{rr}x",
-             "目標下跌區間":f"${ss:.2f} – ${bs:.2f}"},
-        gk={"Delta":"−0.38","Theta":f"~${net/dte:.3f}/天","IV":f"{iv*100:.0f}%"},
-        cost_n=f"最大風險僅 ${net:.2f}/股，比單買 Put 節省 {int((bp-net)/bp*100)}% 成本",
-        warn=f"{'槓桿ETF 波幅大，建議選擇更寬價差；' if lf else ''}若股價反彈，最大損失為 ${net:.2f}。",
-        roll=None,
-        per_share_prem=net,
-    ))
+    # 3 ── Bear Put Spread（FIX #5：只在 BEARISH/NEUTRAL 顯示）
+    if trend in ["BEARISH", "NEUTRAL"]:
+        dte=21
+        bs=round(px*0.97/0.5)*0.5; ss=round(px*0.82/0.5)*0.5
+        bp=prem(px,bs,dte,iv); sp=prem(px,ss,dte,iv)
+        net=round(bp-sp,2); mp=round((bs-ss)-net,2)
+        rr=round(mp/net,1) if net>0 else 0
+        out.append(dict(
+            name="Bear Put Spread｜熊市看跌價差",
+            rec=(trend=="BEARISH"),
+            desc="買入高 Strike Put，同時賣出低 Strike Put，以降低對沖成本。預期下跌但幅度有限時的低成本方案。",
+            acts=[f"買入 {{C}}張 {d['ticker']} ${bs:.2f} Put",
+                  f"賣出 {{C}}張 {d['ticker']} ${ss:.2f} Put",
+                  f"到期日  {(datetime.now()+timedelta(days=dte)).strftime('%Y-%m-%d')}（{dte} DTE）"],
+            det={"買入行使價":f"${bs:.2f} Put",
+                 "賣出行使價":f"${ss:.2f} Put",
+                 "淨支出 Net Debit":f"${net:.2f}/股　(${net*100:.0f}/張)",
+                 "損益平衡點":f"${bs-net:.2f}",
+                 "最大盈利":f"${mp:.2f}/股（股價跌至 ${ss:.2f} 以下）",
+                 "最大虧損":f"${net:.2f}/股（僅限已付權利金）",
+                 "回報風險比":f"{rr}x",
+                 "目標下跌區間":f"${ss:.2f} – ${bs:.2f}"},
+            gk={"Delta":"−0.38","Theta":f"~${net/dte:.3f}/天","IV":f"{iv*100:.0f}%"},
+            cost_n=f"最大風險僅 ${net:.2f}/股，比單買 Put 節省 {int((bp-net)/bp*100)}% 成本",
+            warn=f"{'槓桿ETF 波幅大，建議選擇更寬價差；' if lf else ''}若股價反彈，最大損失為 ${net:.2f}。",
+            roll=None,
+            per_share_prem=net,
+        ))
 
     # 4 ── Bull Call Spread
     if trend in ["BULLISH","NEUTRAL"]:
@@ -390,8 +409,8 @@ def strategies(d):
             name="Bull Call Spread｜牛市看漲價差",
             rec=(trend=="BULLISH"),
             desc="買入接近平值 Call，賣出虛值 Call，低成本參與上漲行情，限定最大損失。",
-            acts=[f"買入 1張 {d['ticker']} ${bs:.2f} Call（接近平值）",
-                  f"賣出 1張 {d['ticker']} ${ss:.2f} Call（虛值 15%）",
+            acts=[f"買入 {{C}}張 {d['ticker']} ${bs:.2f} Call（接近平值）",
+                  f"賣出 {{C}}張 {d['ticker']} ${ss:.2f} Call（虛值 15%）",
                   f"到期日  {(datetime.now()+timedelta(days=dte)).strftime('%Y-%m-%d')}（{dte} DTE）"],
             det={"買入行使價":f"${bs:.2f} Call",
                  "賣出行使價":f"${ss:.2f} Call",
@@ -408,35 +427,34 @@ def strategies(d):
             per_share_prem=net,
         ))
 
-    # 5 ── Iron Condor
-    if trend=="NEUTRAL":
-        dte=30
-        ps=round(px*0.92/0.5)*0.5; pb=round(px*0.85/0.5)*0.5
-        cs=round(px*1.08/0.5)*0.5; cb=round(px*1.15/0.5)*0.5
-        pc=prem(px,ps,dte,iv)-prem(px,pb,dte,iv)
-        cc=prem(px,cs,dte,iv)-prem(px,cb,dte,iv)
-        tot=round(pc+cc,2); ml=round((ps-pb)-tot,2)
-        out.append(dict(
-            name="Iron Condor｜鐵兀鷹",
-            rec=(trend=="NEUTRAL"),
-            desc="賣出 Put 價差 + 賣出 Call 價差，收取雙邊權利金。橫盤震盪市況下，Theta 每天自動累積收入。",
-            acts=[f"賣出 ${ps:.2f} Put ＋ 買入 ${pb:.2f} Put（Put 側）",
-                  f"賣出 ${cs:.2f} Call ＋ 買入 ${cb:.2f} Call（Call 側）",
-                  f"到期日  {(datetime.now()+timedelta(days=dte)).strftime('%Y-%m-%d')}（{dte} DTE）"],
-            det={"收取總權利金":f"${tot:.2f}/股　(${tot*100:.0f}/張)",
-                 "上方損益平衡":f"${cs+tot:.2f}",
-                 "下方損益平衡":f"${ps-tot:.2f}",
-                 "最大盈利區間":f"${ps:.2f} – ${cs:.2f}",
-                 "最大盈利":f"${tot:.2f}/股（全收權利金）",
-                 "最大虧損":f"${ml:.2f}/股",
-                 "每日 Theta":f"+${tot/dte:.3f}/天",
-                 "成本補貼":f"每月收 ${tot:.2f}/股 補貼持倉"},
-            gk={"Delta":"~0 中性","Theta":f"+${tot/dte:.3f}/天","IV":f"{iv*100:.0f}%"},
-            cost_n=f"每月執行，年化理論補貼約 ${tot*12:.2f}/股",
-            warn=f"{'槓桿ETF 單日波幅大，Iron Condor 較高風險；' if lf else ''}股價突破任一側須即時調整或平倉。",
-            roll=f"股價接近任一側邊界時，考慮將該側向外滾倉（Roll Out）。",
-            per_share_prem=tot,
-        ))
+    # 5 ── Iron Condor（FIX #4：所有 trend 均顯示，NEUTRAL 才 rec=True）
+    dte=30
+    ps=round(px*0.92/0.5)*0.5; pb=round(px*0.85/0.5)*0.5
+    cs=round(px*1.08/0.5)*0.5; cb=round(px*1.15/0.5)*0.5
+    pc=prem(px,ps,dte,iv)-prem(px,pb,dte,iv)
+    cc=prem(px,cs,dte,iv)-prem(px,cb,dte,iv)
+    tot=round(pc+cc,2); ml=round((ps-pb)-tot,2)
+    out.append(dict(
+        name="Iron Condor｜鐵兀鷹",
+        rec=(trend=="NEUTRAL"),
+        desc="賣出 Put 價差 + 賣出 Call 價差，收取雙邊權利金。橫盤震盪市況下，Theta 每天自動累積收入。",
+        acts=[f"賣出 ${ps:.2f} Put ＋ 買入 ${pb:.2f} Put（Put 側）",
+              f"賣出 ${cs:.2f} Call ＋ 買入 ${cb:.2f} Call（Call 側）",
+              f"到期日  {(datetime.now()+timedelta(days=dte)).strftime('%Y-%m-%d')}（{dte} DTE）"],
+        det={"收取總權利金":f"${tot:.2f}/股　(${tot*100:.0f}/張)",
+             "上方損益平衡":f"${cs+tot:.2f}",
+             "下方損益平衡":f"${ps-tot:.2f}",
+             "最大盈利區間":f"${ps:.2f} – ${cs:.2f}",
+             "最大盈利":f"${tot:.2f}/股（全收權利金）",
+             "最大虧損":f"${ml:.2f}/股",
+             "每日 Theta":f"+${tot/dte:.3f}/天",
+             "成本補貼":f"每月收 ${tot:.2f}/股 補貼持倉"},
+        gk={"Delta":"~0 中性","Theta":f"+${tot/dte:.3f}/天","IV":f"{iv*100:.0f}%"},
+        cost_n=f"每月執行，年化理論補貼約 ${tot*12:.2f}/股",
+        warn=f"{'槓桿ETF 單日波幅大，Iron Condor 較高風險；' if lf else ''}股價突破任一側須即時調整或平倉。",
+        roll=f"股價接近任一側邊界時，考慮將該側向外滾倉（Roll Out）。",
+        per_share_prem=tot,
+    ))
 
     out.sort(key=lambda x: not x["rec"])
     return out
@@ -451,16 +469,13 @@ def sig_row(dot_cls, label, val):
     return f'<div class="sig-row"><span class="dot {dot_cls}"></span><span class="sig-lbl">{label}</span><span class="sig-val">{val}</span></div>'
 
 def render_metrics(d):
-    pc   = "cu" if d['pnl']>=0 else "cd"
     pf   = "+" if d['pnl']>=0 else ""
-    vc   = "cu" if d['vr']>1.2 else "ca"
     sh   = d.get('shares', 1)
     tot_val  = d['px'] * sh
     tot_cost = d['cost'] * sh
     tot_pnl  = d['pnl'] * sh
     tp_cls   = "cu" if tot_pnl >= 0 else "cd"
     tp_pf    = "+" if tot_pnl >= 0 else ""
-    # contracts: 1 contract = 100 shares
     contracts = sh // 100
     contracts_note = f"{contracts} 張合約可用" if contracts > 0 else "不足 100 股／1 張"
     st.markdown(f"""
@@ -523,20 +538,19 @@ def render_signals(d):
         </div>""", unsafe_allow_html=True)
 
 def render_strat(s, idx, shares=100):
-    contracts = max(1, shares // 100)
+    # FIX #9: 合約數計算統一，< 100 股顯示警告而非強制設 1
+    contracts = shares // 100
+    sub100    = contracts == 0  # 不足 100 股標記
+
     cls  = "sc top" if s['rec'] else "sc"
     tag  = '<span class="top-tag">⭐ 最佳推薦</span><br>' if s['rec'] else ""
 
-    # Inject contracts info into first action line
-    acts_with_cnt = []
-    for i, a in enumerate(s['acts']):
-        if i == 0:
-            # Replace "1張" with actual contract count
-            a_display = a.replace("1張", f"{contracts} 張")
-            acts_with_cnt.append(a_display)
-        else:
-            acts_with_cnt.append(a)
-    acts = "".join([f'<div class="act">→ {a}</div>' for a in acts_with_cnt])
+    # FIX #3: 用 {C} placeholder 統一替換所有 acts 裡的合約數
+    display_contracts = max(1, contracts)  # 顯示用，最少 1 張
+    acts = "".join([
+        f'<div class="act">→ {a.replace("{C}", str(display_contracts))}</div>'
+        for a in s['acts']
+    ])
 
     det  = "".join([f'<div class="dg-cell"><div class="dg-lbl">{k}</div><div class="dg-val">{v}</div></div>'
                     for k,v in s['det'].items()])
@@ -546,8 +560,13 @@ def render_strat(s, idx, shares=100):
     # Position summary box
     pos_html = ""
     if s.get("per_share_prem") is not None:
-        total_prem = s["per_share_prem"] * 100 * contracts
-        pos_html = f'<div class="ib ib-cost">📦 <b>倉位合計（{shares:,} 股 / {contracts} 張合約）</b>：預計總收益／支出 <b>${total_prem:,.0f}</b></div>'
+        total_prem = s["per_share_prem"] * 100 * display_contracts
+        pos_html = f'<div class="ib ib-cost">📦 <b>倉位合計（{shares:,} 股 / {display_contracts} 張合約）</b>：預計總收益／支出 <b>${total_prem:,.0f}</b></div>'
+
+    # FIX #9: 不足 100 股時顯示警告
+    sub100_html = ""
+    if sub100:
+        sub100_html = '<div class="ib ib-sub100">⚠️ <b>持股不足 100 股</b>：期權合約以 100 股為單位。以上策略僅供參考，實際執行需補倉至 100 股以上。</div>'
 
     cn   = f'<div class="ib ib-cost">💡 {s["cost_n"]}</div>' if s.get("cost_n") else ""
     wn   = f'<div class="ib ib-warn">⚠️ {s["warn"]}</div>'  if s.get("warn")   else ""
@@ -561,7 +580,7 @@ def render_strat(s, idx, shares=100):
       <div>{acts}</div>
       <div class="dg-grid">{det}</div>
       <div class="gk-row">{gk}</div>
-      {pos_html}{cn}{wn}{rl}
+      {pos_html}{sub100_html}{cn}{wn}{rl}
     </div>""", unsafe_allow_html=True)
 
 
@@ -595,6 +614,8 @@ if run or st.session_state.get("_t"):
 
     shares = st.session_state.get("_s", 100)
 
+    # FIX #1: data 先初始化為 None，避免 fetch 異常時出現 NameError
+    data = None
     with st.spinner(f"正在抓取 {st.session_state['_t']} 數據並分析…"):
         data = fetch(st.session_state["_t"], st.session_state["_c"])
         if data:
@@ -614,10 +635,11 @@ if run or st.session_state.get("_t"):
             for i, s in enumerate(strategies(data), 1):
                 render_strat(s, i, shares=data.get('shares', 100))
 
+        # FIX #8: 改用 datetime.now(timezone.utc) 確保顯示正確 UTC 時間
         st.markdown(f"""
         <div class="disc">
           ⚠️ 免責聲明：本系統提供的期權策略僅供參考，不構成任何投資建議。
           期權交易涉及重大風險，包括損失全部已支付權利金。請在執行任何交易前諮詢持牌財務顧問。
           市場數據由 Yahoo Finance 提供，可能存在延遲。
-          　📅 分析時間：{datetime.now().strftime('%Y-%m-%d %H:%M')} UTC
+          　📅 分析時間：{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC
         </div>""", unsafe_allow_html=True)
