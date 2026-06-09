@@ -224,6 +224,55 @@ def lev_x(t):  return 3 if t.upper() in LEV3 else (2 if t.upper() in LEV_ALL els
 
 
 # ─────────────────────────────────────────
+# EXPIRY DATE RESOLVER
+# 方案B：從真實期權鏈抓取最接近目標 DTE 的到期日
+# 方案A（降級）：找不到時返回 fallback 說明文字
+# ─────────────────────────────────────────
+@st.cache_data(ttl=300)
+def fetch_expiry_dates(ticker):
+    """返回該 ticker 的真實期權到期日列表（字串格式 YYYY-MM-DD），失敗返回空列表。"""
+    try:
+        tk = yf.Ticker(ticker)
+        dates = tk.options  # tuple of 'YYYY-MM-DD' strings
+        if dates:
+            return list(dates)
+    except Exception:
+        pass
+    return []
+
+def resolve_expiry(ticker, target_dte, expiry_dates):
+    """
+    從真實到期日列表中選出最接近 target_dte 的日期。
+    返回 (expiry_str, actual_dte, is_real)
+      - expiry_str : 顯示用字串，例如 '2026-06-20'
+      - actual_dte : 實際天數
+      - is_real    : True = 真實期權鏈日期；False = 降級估算
+    """
+    today = datetime.now(timezone.utc).date()
+    target_date = today + timedelta(days=target_dte)
+
+    if expiry_dates:
+        best = None
+        best_diff = 9999
+        for d_str in expiry_dates:
+            try:
+                d = datetime.strptime(d_str, "%Y-%m-%d").date()
+                diff = abs((d - target_date).days)
+                if diff < best_diff:
+                    best_diff = diff
+                    best = d
+            except ValueError:
+                continue
+        if best:
+            actual_dte = (best - today).days
+            return best.strftime("%Y-%m-%d"), max(1, actual_dte), True
+
+    # 降級方案A：用計算值並加免責標注
+    fallback_date = (datetime.now(timezone.utc) + timedelta(days=target_dte)).strftime("%Y-%m-%d")
+    return fallback_date, target_dte, False
+
+
+# ─────────────────────────────────────────
 # DATA FETCH & ANALYSIS
 # FIX #7: 加 @st.cache_data(ttl=300) 避免重複抓取，提速
 # ─────────────────────────────────────────
@@ -277,6 +326,8 @@ def fetch(ticker, cost):
         # FIX #10: 加下限 0.05，防止 px 異常時 IV 趨近零
         iv = max(0.05, min(0.95, (atrv/px)*np.sqrt(252)*iv_mult))
 
+        expiry_dates = fetch_expiry_dates(ticker.upper())
+
         return dict(
             ticker=ticker.upper(), px=px, cost=cost,
             pnl=px-cost, pnl_pct=(px-cost)/cost*100,
@@ -286,6 +337,7 @@ def fetch(ticker, cost):
             vr=vr, iv=iv,
             trend=trend, tzh=tzh, conf=conf,
             lev=is_lev(ticker), lx=lev_x(ticker),
+            expiry_dates=expiry_dates,
         )
     except Exception:
         return None
@@ -313,22 +365,31 @@ def prem(px, strike, dte, iv):
 # FIX #5: Bear Put Spread 只在 BEARISH/NEUTRAL 加入
 # ─────────────────────────────────────────
 def strategies(d):
-    px,cost,iv  = d['px'], d['cost'], d['iv']
-    trend,lf    = d['trend'], d['lev']
-    pp          = d['pnl_pct']
-    out         = []
+    px,cost,iv   = d['px'], d['cost'], d['iv']
+    trend,lf     = d['trend'], d['lev']
+    pp           = d['pnl_pct']
+    exp_dates    = d.get('expiry_dates', [])
+    out          = []
+
+    def expiry_label(target_dte):
+        """返回 (到期日顯示字串, 實際DTE, 真實日期flag)"""
+        exp_str, actual_dte, is_real = resolve_expiry(d['ticker'], target_dte, exp_dates)
+        suffix = "" if is_real else "（估算）"
+        label  = f"{exp_str}{suffix}（{actual_dte} DTE）"
+        return label, actual_dte, is_real
 
     # 1 ── Covered Call
-    dte = 21 if lf else 30
+    target_dte = 21 if lf else 30
     otm = 0.10 if lf else 0.08
     sk  = round(px*(1+otm)/0.5)*0.5
-    pr  = prem(px,sk,dte,iv)
+    exp_lbl, dte, is_real = expiry_label(target_dte)
+    pr  = prem(px, sk, dte, iv)
     out.append(dict(
         name="Covered Call｜備兌認購",
         rec=(trend in ["NEUTRAL","BULLISH"] or pp<0),
         desc="持有正股，賣出虛值 Call 收取權利金，逐步攤薄持倉成本。橫盤或緩漲市況下效果最佳，每月滾倉可持續降低成本。",
         acts=[f"賣出 {{C}}張 {d['ticker']} ${sk:.2f} Call",
-              f"到期日  {(datetime.now()+timedelta(days=dte)).strftime('%Y-%m-%d')}（{dte} DTE）"],
+              f"到期日  {exp_lbl}"],
         det={"建議行使價":f"${sk:.2f}（虛值 {int(otm*100)}%）",
              "到期天數":f"{dte} DTE",
              "預計收取權利金":f"${pr:.2f}/股　(${pr*100:.0f}/張)",
@@ -340,20 +401,22 @@ def strategies(d):
         gk={"Delta":f"−0.{int(30+otm*100)}","Theta":f"+${pr/dte:.3f}/天","IV":f"{iv*100:.0f}%"},
         cost_n=f"每月執行一次，年化成本攤薄約 {pr/cost*100*12:.0f}%（理論值）",
         warn=f"{'槓桿ETF IV 極高，若急升將錯失漲幅；' if lf else ''}股價若突破 ${sk:.2f}，持倉將被 Call 走。",
-        roll=f"股價接近行使價時，考慮 Roll Up & Out 延長到期日。",
+        roll="股價接近行使價時，考慮 Roll Up & Out 延長到期日。",
+        expiry_real=is_real,
         per_share_prem=pr,
     ))
 
     # 2 ── Protective Put
-    dte = 30 if lf else 45
+    target_dte = 30 if lf else 45
     sk  = round(px*0.90/0.5)*0.5
-    pr  = prem(px,sk,dte,iv)
+    exp_lbl, dte, is_real = expiry_label(target_dte)
+    pr  = prem(px, sk, dte, iv)
     out.append(dict(
         name="Protective Put｜保護性認沽",
         rec=(trend=="BEARISH" and pp>-10),
         desc="買入虛值 Put 作為保險，限定下行虧損上限。適合市況不明朗或持倉成本較高時使用。",
         acts=[f"買入 {{C}}張 {d['ticker']} ${sk:.2f} Put",
-              f"到期日  {(datetime.now()+timedelta(days=dte)).strftime('%Y-%m-%d')}（{dte} DTE）"],
+              f"到期日  {exp_lbl}"],
         det={"建議行使價":f"${sk:.2f}（虛值 10%）",
              "到期天數":f"{dte} DTE",
              "預計支付權利金":f"${pr:.2f}/股　(${pr*100:.0f}/張)",
@@ -365,14 +428,16 @@ def strategies(d):
         gk={"Delta":"+0.28","Theta":f"−${pr/dte:.3f}/天","IV":f"{iv*100:.0f}%"},
         cost_n=f"保護成本 ${pr:.2f}/股，相當於持倉成本增加 {pr/cost*100:.1f}%",
         warn=f"{'槓桿ETF Theta 衰減極快，建議縮短 DTE 或改用 Bear Put Spread；' if lf else ''}若股價橫盤，保護金將完全損耗。",
-        roll=f"距到期 10 天且虧損未實現，考慮換入更低 Strike 延長保護。",
+        roll="距到期 10 天且虧損未實現，考慮換入更低 Strike 延長保護。",
+        expiry_real=is_real,
         per_share_prem=pr,
     ))
 
-    # 3 ── Bear Put Spread（FIX #5：只在 BEARISH/NEUTRAL 顯示）
+    # 3 ── Bear Put Spread（只在 BEARISH/NEUTRAL 顯示）
     if trend in ["BEARISH", "NEUTRAL"]:
-        dte=21
+        target_dte = 21
         bs=round(px*0.97/0.5)*0.5; ss=round(px*0.82/0.5)*0.5
+        exp_lbl, dte, is_real = expiry_label(target_dte)
         bp=prem(px,bs,dte,iv); sp=prem(px,ss,dte,iv)
         net=round(bp-sp,2); mp=round((bs-ss)-net,2)
         rr=round(mp/net,1) if net>0 else 0
@@ -382,7 +447,7 @@ def strategies(d):
             desc="買入高 Strike Put，同時賣出低 Strike Put，以降低對沖成本。預期下跌但幅度有限時的低成本方案。",
             acts=[f"買入 {{C}}張 {d['ticker']} ${bs:.2f} Put",
                   f"賣出 {{C}}張 {d['ticker']} ${ss:.2f} Put",
-                  f"到期日  {(datetime.now()+timedelta(days=dte)).strftime('%Y-%m-%d')}（{dte} DTE）"],
+                  f"到期日  {exp_lbl}"],
             det={"買入行使價":f"${bs:.2f} Put",
                  "賣出行使價":f"${ss:.2f} Put",
                  "淨支出 Net Debit":f"${net:.2f}/股　(${net*100:.0f}/張)",
@@ -395,13 +460,15 @@ def strategies(d):
             cost_n=f"最大風險僅 ${net:.2f}/股，比單買 Put 節省 {int((bp-net)/bp*100)}% 成本",
             warn=f"{'槓桿ETF 波幅大，建議選擇更寬價差；' if lf else ''}若股價反彈，最大損失為 ${net:.2f}。",
             roll=None,
+            expiry_real=is_real,
             per_share_prem=net,
         ))
 
     # 4 ── Bull Call Spread
     if trend in ["BULLISH","NEUTRAL"]:
-        dte=30
+        target_dte = 30
         bs=round(px*1.01/0.5)*0.5; ss=round(px*1.15/0.5)*0.5
+        exp_lbl, dte, is_real = expiry_label(target_dte)
         bp=prem(px,bs,dte,iv); sp=prem(px,ss,dte,iv)
         net=round(bp-sp,2); mp=round((ss-bs)-net,2)
         rr=round(mp/net,1) if net>0 else 0
@@ -411,7 +478,7 @@ def strategies(d):
             desc="買入接近平值 Call，賣出虛值 Call，低成本參與上漲行情，限定最大損失。",
             acts=[f"買入 {{C}}張 {d['ticker']} ${bs:.2f} Call（接近平值）",
                   f"賣出 {{C}}張 {d['ticker']} ${ss:.2f} Call（虛值 15%）",
-                  f"到期日  {(datetime.now()+timedelta(days=dte)).strftime('%Y-%m-%d')}（{dte} DTE）"],
+                  f"到期日  {exp_lbl}"],
             det={"買入行使價":f"${bs:.2f} Call",
                  "賣出行使價":f"${ss:.2f} Call",
                  "淨支出 Net Debit":f"${net:.2f}/股　(${net*100:.0f}/張)",
@@ -423,14 +490,16 @@ def strategies(d):
             gk={"Delta":"+0.45","Theta":f"−${net/dte:.3f}/天","IV":f"{iv*100:.0f}%"},
             cost_n=f"最大損失 ${net:.2f}/股，股價須升破 ${bs+net:.2f} 方可獲利",
             warn=f"{'槓桿ETF Call 溢價急升，需快速止盈；' if lf else ''}需在到期前升破損益平衡點才獲利。",
-            roll=f"盈利達 60–70% 時建議止盈，無需持有至到期。",
+            roll="盈利達 60–70% 時建議止盈，無需持有至到期。",
+            expiry_real=is_real,
             per_share_prem=net,
         ))
 
-    # 5 ── Iron Condor（FIX #4：所有 trend 均顯示，NEUTRAL 才 rec=True）
-    dte=30
+    # 5 ── Iron Condor（所有 trend 均顯示，NEUTRAL 才 rec=True）
+    target_dte = 30
     ps=round(px*0.92/0.5)*0.5; pb=round(px*0.85/0.5)*0.5
     cs=round(px*1.08/0.5)*0.5; cb=round(px*1.15/0.5)*0.5
+    exp_lbl, dte, is_real = expiry_label(target_dte)
     pc=prem(px,ps,dte,iv)-prem(px,pb,dte,iv)
     cc=prem(px,cs,dte,iv)-prem(px,cb,dte,iv)
     tot=round(pc+cc,2); ml=round((ps-pb)-tot,2)
@@ -440,7 +509,7 @@ def strategies(d):
         desc="賣出 Put 價差 + 賣出 Call 價差，收取雙邊權利金。橫盤震盪市況下，Theta 每天自動累積收入。",
         acts=[f"賣出 ${ps:.2f} Put ＋ 買入 ${pb:.2f} Put（Put 側）",
               f"賣出 ${cs:.2f} Call ＋ 買入 ${cb:.2f} Call（Call 側）",
-              f"到期日  {(datetime.now()+timedelta(days=dte)).strftime('%Y-%m-%d')}（{dte} DTE）"],
+              f"到期日  {exp_lbl}"],
         det={"收取總權利金":f"${tot:.2f}/股　(${tot*100:.0f}/張)",
              "上方損益平衡":f"${cs+tot:.2f}",
              "下方損益平衡":f"${ps-tot:.2f}",
@@ -452,7 +521,8 @@ def strategies(d):
         gk={"Delta":"~0 中性","Theta":f"+${tot/dte:.3f}/天","IV":f"{iv*100:.0f}%"},
         cost_n=f"每月執行，年化理論補貼約 ${tot*12:.2f}/股",
         warn=f"{'槓桿ETF 單日波幅大，Iron Condor 較高風險；' if lf else ''}股價突破任一側須即時調整或平倉。",
-        roll=f"股價接近任一側邊界時，考慮將該側向外滾倉（Roll Out）。",
+        roll="股價接近任一側邊界時，考慮將該側向外滾倉（Roll Out）。",
+        expiry_real=is_real,
         per_share_prem=tot,
     ))
 
@@ -571,6 +641,10 @@ def render_strat(s, idx, shares=100):
     cn   = f'<div class="ib ib-cost">💡 {s["cost_n"]}</div>' if s.get("cost_n") else ""
     wn   = f'<div class="ib ib-warn">⚠️ {s["warn"]}</div>'  if s.get("warn")   else ""
     rl   = f'<div class="ib ib-roll">🔄 {s["roll"]}</div>'  if s.get("roll")   else ""
+    # 到期日來源標注：估算時顯示提醒
+    ex_warn = ""
+    if s.get("expiry_real") is False:
+        ex_warn = '<div class="ib ib-warn">📅 <b>到期日為估算值</b>：無法取得真實期權鏈，日期以目標 DTE 推算，請在券商確認實際可交易到期日再下單。</div>'
 
     st.markdown(f"""
     <div class="{cls}">
@@ -580,7 +654,7 @@ def render_strat(s, idx, shares=100):
       <div>{acts}</div>
       <div class="dg-grid">{det}</div>
       <div class="gk-row">{gk}</div>
-      {pos_html}{sub100_html}{cn}{wn}{rl}
+      {pos_html}{sub100_html}{ex_warn}{cn}{wn}{rl}
     </div>""", unsafe_allow_html=True)
 
 
