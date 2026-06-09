@@ -384,6 +384,11 @@ def strategies(d):
     sk  = round(px*(1+otm)/0.5)*0.5
     exp_lbl, dte, is_real = expiry_label(target_dte)
     pr  = prem(px, sk, dte, iv)
+    # 滾倉例子：當前 Call 價值已跌至 50% 或股價逼近行使價
+    roll_buy_back = round(pr * 0.5, 2)           # 50% 盈利回補價
+    new_sk        = round(sk * 1.05 / 0.5) * 0.5 # Roll Up：行使價上移 5%
+    new_pr        = prem(px, new_sk, dte + 30, iv)
+    net_credit    = round(new_pr - roll_buy_back, 2)
     out.append(dict(
         name="Covered Call｜備兌認購",
         rec=(trend in ["NEUTRAL","BULLISH"] or pp<0),
@@ -401,7 +406,14 @@ def strategies(d):
         gk={"Delta":f"−0.{int(30+otm*100)}","Theta":f"+${pr/dte:.3f}/天","IV":f"{iv*100:.0f}%"},
         cost_n=f"每月執行一次，年化成本攤薄約 {pr/cost*100*12:.0f}%（理論值）",
         warn=f"{'槓桿ETF IV 極高，若急升將錯失漲幅；' if lf else ''}股價若突破 ${sk:.2f}，持倉將被 Call 走。",
-        roll="股價接近行使價時，考慮 Roll Up & Out 延長到期日。",
+        roll=(
+            f"<b>🔄 Roll Up & Out 操作步驟（以當前數據為例）</b><br>"
+            f"<b>觸發條件：</b>盈利已達 50%（現有 Call 市價跌至 ≈${roll_buy_back:.2f}），或股價升至 ${sk:.2f} 以內 3% 範圍。<br>"
+            f"<b>步驟 ①</b> 買回現有 ${sk:.2f} Call（約 ${roll_buy_back:.2f}/股，即 ${roll_buy_back*100:.0f}/張）。<br>"
+            f"<b>步驟 ②</b> 同時賣出新的 ${new_sk:.2f} Call，延長 30 天到期（估值約 ${new_pr:.2f}/股）。<br>"
+            f"<b>步驟 ③</b> 淨結果：{'收取額外 $' + str(net_credit) + '/股 信用' if net_credit > 0 else '需補貼 $' + str(abs(net_credit)) + '/股，換取更高行使價保護'}。<br>"
+            f"<b>目的：</b>保留正股上升空間，同時繼續收取 Theta 收入，避免持倉被 Call 走。"
+        ),
         expiry_real=is_real,
         per_share_prem=pr,
     ))
@@ -411,6 +423,10 @@ def strategies(d):
     sk  = round(px*0.90/0.5)*0.5
     exp_lbl, dte, is_real = expiry_label(target_dte)
     pr  = prem(px, sk, dte, iv)
+    new_sk_put   = round(sk * 0.97 / 0.5) * 0.5   # Roll Down：降低行使價
+    new_pr_put   = prem(px, new_sk_put, dte + 21, iv)
+    roll_sell    = round(pr * 0.3, 2)               # Put 仍有 30% 殘值可賣出
+    net_put_cost = round(new_pr_put - roll_sell, 2)
     out.append(dict(
         name="Protective Put｜保護性認沽",
         rec=(trend=="BEARISH" and pp>-10),
@@ -428,7 +444,14 @@ def strategies(d):
         gk={"Delta":"+0.28","Theta":f"−${pr/dte:.3f}/天","IV":f"{iv*100:.0f}%"},
         cost_n=f"保護成本 ${pr:.2f}/股，相當於持倉成本增加 {pr/cost*100:.1f}%",
         warn=f"{'槓桿ETF Theta 衰減極快，建議縮短 DTE 或改用 Bear Put Spread；' if lf else ''}若股價橫盤，保護金將完全損耗。",
-        roll="距到期 10 天且虧損未實現，考慮換入更低 Strike 延長保護。",
+        roll=(
+            f"<b>🔄 Roll Down & Out 操作步驟（以當前數據為例）</b><br>"
+            f"<b>觸發條件：</b>距到期剩 10 天內，且股價仍未跌破 ${sk:.2f}（保護尚未啟動，Theta 急速耗損）。<br>"
+            f"<b>步驟 ①</b> 賣出現有 ${sk:.2f} Put 殘值（估約 ${roll_sell:.2f}/股，即 ${roll_sell*100:.0f}/張）。<br>"
+            f"<b>步驟 ②</b> 買入新的 ${new_sk_put:.2f} Put，延長 21 天到期（估值約 ${new_pr_put:.2f}/股）。<br>"
+            f"<b>步驟 ③</b> 淨追加成本：約 ${net_put_cost:.2f}/股（以較低行使價換取時間延伸）。<br>"
+            f"<b>何時放棄？</b>若股價已大幅反彈，可直接讓 Put 到期作廢，損失僅限已付 ${pr:.2f}/股 權利金。"
+        ),
         expiry_real=is_real,
         per_share_prem=pr,
     ))
@@ -441,6 +464,8 @@ def strategies(d):
         bp=prem(px,bs,dte,iv); sp=prem(px,ss,dte,iv)
         net=round(bp-sp,2); mp=round((bs-ss)-net,2)
         rr=round(mp/net,1) if net>0 else 0
+        tp_price  = round(net + mp * 0.65, 2)  # 65% 最大盈利止盈
+        tp_pnl    = round(mp * 0.65, 2)
         out.append(dict(
             name="Bear Put Spread｜熊市看跌價差",
             rec=(trend=="BEARISH"),
@@ -459,7 +484,13 @@ def strategies(d):
             gk={"Delta":"−0.38","Theta":f"~${net/dte:.3f}/天","IV":f"{iv*100:.0f}%"},
             cost_n=f"最大風險僅 ${net:.2f}/股，比單買 Put 節省 {int((bp-net)/bp*100)}% 成本",
             warn=f"{'槓桿ETF 波幅大，建議選擇更寬價差；' if lf else ''}若股價反彈，最大損失為 ${net:.2f}。",
-            roll=None,
+            roll=(
+                f"<b>🔄 止盈 / 止損操作指引（以當前數據為例）</b><br>"
+                f"<b>建議止盈（65% Max Profit）：</b>價差淨值升至 ≈${tp_price:.2f}/股 時平倉，鎖定 ${tp_pnl:.2f}/股 利潤，無需等到期。<br>"
+                f"<b>平倉方法：</b>買回 ${ss:.2f} Put（解除賣方義務），同時賣出 ${bs:.2f} Put。<br>"
+                f"<b>止損線：</b>若股價反彈超過 ${round(bs*1.03/0.5)*0.5:.2f}（買入行使價上方 3%），整個價差已無價值，直接讓其到期。<br>"
+                f"<b>不建議滾倉：</b>Bear Put Spread 本身已鎖定最大損失，若方向錯誤，直接止損比滾倉更划算。"
+            ),
             expiry_real=is_real,
             per_share_prem=net,
         ))
@@ -472,6 +503,8 @@ def strategies(d):
         bp=prem(px,bs,dte,iv); sp=prem(px,ss,dte,iv)
         net=round(bp-sp,2); mp=round((ss-bs)-net,2)
         rr=round(mp/net,1) if net>0 else 0
+        tp_val  = round(net + mp * 0.65, 2)
+        tp_pnl2 = round(mp * 0.65, 2)
         out.append(dict(
             name="Bull Call Spread｜牛市看漲價差",
             rec=(trend=="BULLISH"),
@@ -490,7 +523,13 @@ def strategies(d):
             gk={"Delta":"+0.45","Theta":f"−${net/dte:.3f}/天","IV":f"{iv*100:.0f}%"},
             cost_n=f"最大損失 ${net:.2f}/股，股價須升破 ${bs+net:.2f} 方可獲利",
             warn=f"{'槓桿ETF Call 溢價急升，需快速止盈；' if lf else ''}需在到期前升破損益平衡點才獲利。",
-            roll="盈利達 60–70% 時建議止盈，無需持有至到期。",
+            roll=(
+                f"<b>🔄 止盈 / Roll Up 操作指引（以當前數據為例）</b><br>"
+                f"<b>建議止盈（65% Max Profit）：</b>價差淨值升至 ≈${tp_val:.2f}/股 時平倉，鎖定 ${tp_pnl2:.2f}/股 利潤，避免 Gamma 風險。<br>"
+                f"<b>平倉方法：</b>賣出 ${bs:.2f} Call（套現），同時買回 ${ss:.2f} Call（解除義務），一筆交易完成。<br>"
+                f"<b>Roll Up（股價大升情況）：</b>若股價突破 ${ss:.2f}，可考慮將整個 Spread 向上移（買回現有，另建更高 Strike 的新 Spread），追蹤升勢。<br>"
+                f"<b>止損線：</b>虧損達 50%（淨值跌至 ${round(net*0.5,2):.2f}）時考慮出場，避免全額損失 ${net:.2f}。"
+            ),
             expiry_real=is_real,
             per_share_prem=net,
         ))
@@ -503,6 +542,13 @@ def strategies(d):
     pc=prem(px,ps,dte,iv)-prem(px,pb,dte,iv)
     cc=prem(px,cs,dte,iv)-prem(px,cb,dte,iv)
     tot=round(pc+cc,2); ml=round((ps-pb)-tot,2)
+    # 滾倉例子：Call 側被突破
+    new_cs  = round(cs * 1.05 / 0.5) * 0.5
+    new_cb  = round(cb * 1.05 / 0.5) * 0.5
+    new_cc  = prem(px, new_cs, dte + 21, iv) - prem(px, new_cb, dte + 21, iv)
+    old_cc  = round(cc, 2)
+    roll_cost = round(old_cc - new_cc, 2)
+    tp_ic   = round(tot * 0.5, 2)
     out.append(dict(
         name="Iron Condor｜鐵兀鷹",
         rec=(trend=="NEUTRAL"),
@@ -521,7 +567,15 @@ def strategies(d):
         gk={"Delta":"~0 中性","Theta":f"+${tot/dte:.3f}/天","IV":f"{iv*100:.0f}%"},
         cost_n=f"每月執行，年化理論補貼約 ${tot*12:.2f}/股",
         warn=f"{'槓桿ETF 單日波幅大，Iron Condor 較高風險；' if lf else ''}股價突破任一側須即時調整或平倉。",
-        roll="股價接近任一側邊界時，考慮將該側向外滾倉（Roll Out）。",
+        roll=(
+            f"<b>🔄 單側 Roll Out 操作步驟（以 Call 側突破為例）</b><br>"
+            f"<b>觸發條件：</b>股價升破或逼近 ${cs:.2f}（賣出 Call 行使價），Call 側出現虧損。<br>"
+            f"<b>步驟 ①</b> 買回原有 Call 價差（${cs:.2f}/${cb:.2f}），平掉虧損側，Put 側繼續持有。<br>"
+            f"<b>步驟 ②</b> 賣出新的 Call 價差：${new_cs:.2f} Call（賣）/ ${new_cb:.2f} Call（買），延長 21 天。<br>"
+            f"<b>步驟 ③ 費用估算：</b>新 Call 側收入約 ${new_cc:.2f}/股，{'可收取額外信用 $' + str(abs(roll_cost)) if roll_cost < 0 else '需補貼約 $' + str(roll_cost)}。<br>"
+            f"<b>止盈目標：</b>整個 Condor 盈利達 50%（即收回 ${tp_ic:.2f}/股）時建議平倉，毋需等到期。<br>"
+            f"<b>最壞情況：</b>若雙側同時被突破，直接全部平倉止損，最大虧損已鎖定在 ${ml:.2f}/股。"
+        ),
         expiry_real=is_real,
         per_share_prem=tot,
     ))
@@ -640,7 +694,7 @@ def render_strat(s, idx, shares=100):
 
     cn   = f'<div class="ib ib-cost">💡 {s["cost_n"]}</div>' if s.get("cost_n") else ""
     wn   = f'<div class="ib ib-warn">⚠️ {s["warn"]}</div>'  if s.get("warn")   else ""
-    rl   = f'<div class="ib ib-roll">🔄 {s["roll"]}</div>'  if s.get("roll")   else ""
+    rl   = f'<div class="ib ib-roll" style="line-height:1.75">{s["roll"]}</div>' if s.get("roll") else ""
     # 到期日來源標注：估算時顯示提醒
     ex_warn = ""
     if s.get("expiry_real") is False:
